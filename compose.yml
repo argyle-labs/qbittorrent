@@ -1,0 +1,32 @@
+# qBittorrent - BitTorrent Client
+# docs: ../../docs/services/qbittorrent.md
+
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:${QBITTORRENT_IMAGE_TAG:-latest}
+    container_name: qbittorrent
+    environment:
+      - PUID=${PUID:-99}
+      - PGID=${PGID:-100}
+      - TZ=${TZ:-America/Denver}
+      - WEBUI_PORT=${QBITTORRENT_PORT:-8070}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${QBITTORRENT_PORT:-8070}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "${QBITTORRENT_PORT:-8070}:${QBITTORRENT_PORT:-8070}"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ${QBITTORRENT_CONFIG_PATH:-/opt/appdata/qbittorrent}:/config
+      - ${DOWNLOADS_PATH:-/mnt/pool/downloads}:/downloads
+    networks:
+      - media
+    restart: unless-stopped
+
+networks:
+  media:
+    external: true
