@@ -3,7 +3,7 @@
 BitTorrent client.
 
 - **Host**: <host> — see [Network Map](../network/network-map.md)
-- **Port**: 8070 (Web UI), 6881 (torrent)
+- **Port**: 8080 (Web UI), 6881 (BitTorrent)
 - **Image**: `lscr.io/linuxserver/qbittorrent`
 - **Compose**: [compose/qbittorrent/docker-compose.yml](../../compose/qbittorrent/docker-compose.yml)
 - **Network**: `media`
