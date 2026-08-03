@@ -1,4 +1,4 @@
-//! qbittorrent service backend — qBittorrent torrent client.
+//! qbittorrent service backend — qBittorrent BitTorrent transfer client.
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
 //! (deploy/backup/restore/configure/status/connect/sync) drive qbittorrent. No
