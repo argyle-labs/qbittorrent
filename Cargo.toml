@@ -2,7 +2,7 @@
 name = "qbittorrent"
 version = "0.1.0"
 edition = "2021"
-description = "qBittorrent torrent client — orca service-backend"
+description = "qBittorrent BitTorrent transfer client — orca service-backend"
 
 [package.metadata.orca]
 category = "downloads"
