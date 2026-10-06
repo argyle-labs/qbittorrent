@@ -73,7 +73,7 @@ Back up the config/data volume(s) above — that's the whole service state (stop
 
 ## With orca
 
-orca drives this plugin through the single generic `service.*` surface — no per-plugin tools:
+orca drives this plugin through the generic `service.*` surface:
 
 ```sh
 orca service.deploy qbittorrent      # render + launch on any supported runtime
@@ -81,6 +81,19 @@ orca service.status qbittorrent      # health + rich diagnostics (typed payload)
 orca service.backup qbittorrent      # location-agnostic backup (tar; PBS on Proxmox)
 orca service.configure qbittorrent   # apply config via the upstream API
 ```
+
+plus WebUI tools against a registered endpoint (`qbittorrent.create`):
+
+```sh
+orca qbittorrent.listen_port.status --name dl --expected-port 51234
+orca qbittorrent.listen_port.sync --name dl --port 51234            # dry run: reports drift
+orca qbittorrent.listen_port.sync --name dl --port-file /path/forwarded_port --execute
+```
+
+`listen_port.sync` sets qBittorrent's listen port (and turns off `random_port`) to
+the target: the VPN forwarded port when inbound traffic reaches the client
+unmapped, or the internal port of a fixed NAT mapping (`PIA-PF-port -> host:6881`
+means a target of `6881`). It writes only on drift.
 
 ## Layout
 

@@ -13,6 +13,12 @@ generic `service.*` surface — no per-plugin tools. Runtimes: **docker,podman,l
 > in orca today (`service.list` shows it). `workload_spec`/`configure`/`status`
 > are being filled in per plugin.
 
+## Tools (`qbittorrent.`)
+- [x] endpoint registry `qbittorrent.{list,detail,create,update,delete}` — routes + username + password (secret)
+- [x] `listen_port.status` — listen port, `connected`/`firewalled`/`disconnected`, match against an expected port
+- [x] `listen_port.sync` — converge the listen port on a target port (explicit or from a port file); dry run by default
+- [ ] read the live PIA forwarded port from orca (no plugin exposes it yet; see argyle-labs/opnsense)
+
 ## Provided generically by orca (NO code here)
 - `deploy` — `service.deploy` → `deploy_target.launch(WorkloadSpec)`
 - `backup` / `restore` — pluggable `BackupMethod` (tar; **PBS** for Proxmox guests)

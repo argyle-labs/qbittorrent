@@ -16,9 +16,8 @@ crate-type = ["rlib"]
 name = "qbittorrent"
 path = "src/main.rs"
 
-# qbittorrent is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
-# ServiceBackend over the orca socket and reaches the whole orca system
-# through plugin-toolkit alone.
+# qbittorrent registers a ServiceBackend plus the `qbittorrent.` WebUI tools over
+# the orca socket and reaches the whole orca system through plugin-toolkit alone.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
@@ -26,6 +25,7 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" 
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+wiremock = "0.6"
 
 [lints.clippy]
 let_underscore_must_use = "deny"
