@@ -224,15 +224,22 @@ fn announce_blocked(prefs: &Preferences, libtorrent: &str) -> Option<String> {
     prefs.random_port.then(|| ANNOUNCE_RANDOM_PORT.to_string())
 }
 
+/// How listen mode treats a leftover non-zero `announce_port`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leftover {
+    Drift,
+    Ignore,
+}
+
 /// `random_port` counts as drift in both modes: it reports `listen_port == 0`,
 /// where libtorrent binds an ephemeral port, so the NAT target is not fixed.
-/// In listen mode, with `check_announce`, a non-zero `announce_port` other than
-/// the target is drift too, since trackers would be told that port instead.
-pub fn in_sync(prefs: &Preferences, mode: Mode, target: u16, check_announce: bool) -> bool {
+/// In listen mode, with [`Leftover::Drift`], a non-zero `announce_port` other
+/// than the target is drift too, since trackers would be told that port instead.
+fn in_sync(prefs: &Preferences, mode: Mode, target: u16, leftover: Leftover) -> bool {
     let port_ok = match mode {
         Mode::Listen => {
             prefs.listen_port == target
-                && (!check_announce || leftover_announce_port(prefs, target).is_none())
+                && (leftover == Leftover::Ignore || leftover_announce_port(prefs, target).is_none())
         }
         Mode::Announce => prefs.reported_port() == Some(target),
     };
@@ -283,7 +290,14 @@ pub async fn status(
     let announce_effective = announce_effective(&prefs, &libtorrent);
     let matches = expected_port
         .filter(|_| mode == Mode::Listen || announce_effective)
-        .map(|p| in_sync(&prefs, mode, p, announce_effective));
+        .map(|p| {
+            let leftover = if announce_effective {
+                Leftover::Drift
+            } else {
+                Leftover::Ignore
+            };
+            in_sync(&prefs, mode, p, leftover)
+        });
     let leftover_announce_port = (mode == Mode::Listen && !announce_effective)
         .then(|| leftover_announce_port(&prefs, prefs.listen_port))
         .flatten();
@@ -331,7 +345,7 @@ pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<
     };
     // Listen mode clears a leftover announce_port even where libtorrent ignores
     // it today: it takes effect once qBittorrent is upgraded.
-    let already = blocked.is_none() && in_sync(&prefs, mode, target, true);
+    let already = blocked.is_none() && in_sync(&prefs, mode, target, Leftover::Drift);
     if execute {
         if let Some(reason) = &blocked {
             bail!("{reason}");
@@ -342,7 +356,7 @@ pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<
         ui.set_port(mode, target, prefs.announce_port.is_some())
             .await?;
         let after = ui.preferences().await?;
-        if !in_sync(&after, mode, target, true) {
+        if !in_sync(&after, mode, target, Leftover::Drift) {
             bail!(
                 "qbittorrent did not take {mode:?} port {target}: listen_port={} \
                  announce_port={:?} random_port={}",

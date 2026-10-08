@@ -52,7 +52,10 @@ pub struct ListenPortStatusArgs {
 /// Read qBittorrent's BitTorrent listen and announce ports, libtorrent version
 /// and whether `announce_port` takes effect, connection status
 /// (`connected`/`firewalled`/`disconnected`), and whether the selected mode's
-/// port matches `expected_port`.
+/// port matches `expected_port`. In listen mode on libtorrent before 2.0.11,
+/// `leftover_announce_port` reports a non-zero `announce_port` that trackers do
+/// not hear yet: `matches` stays true, but `listen_port.sync` still clears it
+/// because it takes effect once qBittorrent is upgraded.
 #[orca_tool(domain = "qbittorrent", verb = "listen_port.status", role = "any")]
 async fn qbittorrent_listen_port_status(
     args: ListenPortStatusArgs,
@@ -118,16 +121,11 @@ mod tests {
     use plugin_toolkit::contract::CallerIdentity;
     use std::sync::{Arc, OnceLock};
 
-    /// Keeps any orca state lookup off the live `~/.orca`.
-    fn orca_home() -> &'static std::path::Path {
-        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
-        let dir = HOME.get_or_init(|| tempfile::tempdir().unwrap()).path();
-        std::env::set_var("ORCA_HOME", dir);
-        dir
-    }
-
+    /// The toolkit already sandboxes orca state under `cargo test`; the ctx
+    /// paths point at a tempdir too.
     fn ctx() -> ToolCtx {
-        let home = orca_home();
+        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let home = HOME.get_or_init(|| tempfile::tempdir().unwrap()).path();
         ToolCtx::new(Arc::new(Config {
             anthropic_api_key: None,
             lmstudio_url: String::new(),
