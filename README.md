@@ -73,7 +73,7 @@ Back up the config/data volume(s) above — that's the whole service state (stop
 
 ## With orca
 
-orca drives this plugin through the single generic `service.*` surface — no per-plugin tools:
+orca drives this plugin through the generic `service.*` surface:
 
 ```sh
 orca service.deploy qbittorrent      # render + launch on any supported runtime
@@ -81,6 +81,30 @@ orca service.status qbittorrent      # health + rich diagnostics (typed payload)
 orca service.backup qbittorrent      # location-agnostic backup (tar; PBS on Proxmox)
 orca service.configure qbittorrent   # apply config via the upstream API
 ```
+
+plus WebUI tools against a registered endpoint (`qbittorrent.create`):
+
+```sh
+orca opnsense.pia.forwarded_port --name gw                           # -> {"port": 51234, ...}
+orca qbittorrent.listen_port.status --name dl --expected-port 51234
+orca qbittorrent.listen_port.sync --name dl --port 51234            # dry run: reports drift
+orca qbittorrent.listen_port.sync --name dl --port 51234 --execute
+orca qbittorrent.listen_port.sync --name dl --mode listen --port-file /gluetun/forwarded_port --execute
+```
+
+`listen_port.sync` has two modes. It writes only on drift and treats `random_port`
+as drift in both.
+
+- `announce` (default): behind a fixed NAT mapping (`PIA-PF-port -> host:6881`)
+  qBittorrent keeps listening on `6881` and the PIA port goes to `announce_port`,
+  the port reported to trackers. Needs qBittorrent 5.1+ built against libtorrent
+  2.0.11+ (older builds save the value but ignore it); it refuses otherwise.
+  It only changes what trackers and DHT are told, not the actual listener or
+  local service discovery.
+- `listen`: when inbound traffic reaches the client unmapped, the PIA port
+  becomes the listen port, `random_port` is turned off and `announce_port` is
+  reset to `0`. Use it with gluetun's `forwarded_port` file: gluetun does not
+  remap the port.
 
 ## Layout
 

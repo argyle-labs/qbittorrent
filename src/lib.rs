@@ -1,10 +1,14 @@
 //! qbittorrent service backend — qBittorrent BitTorrent transfer client.
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive qbittorrent. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! (deploy/backup/restore/configure/status/connect/sync) drive qbittorrent,
+//! alongside the `qbittorrent.` WebUI tools in [`tools`]. The only orca dep is
+//! `plugin-toolkit`. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
+
+pub mod execute;
+pub mod listen_port;
+pub mod tools;
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
