@@ -89,7 +89,7 @@ orca opnsense.pia.forwarded_port --name gw                           # -> {"port
 orca qbittorrent.listen_port.status --name dl --expected-port 51234
 orca qbittorrent.listen_port.sync --name dl --port 51234            # dry run: reports drift
 orca qbittorrent.listen_port.sync --name dl --port 51234 --execute
-orca qbittorrent.listen_port.sync --name dl --mode listen --port-file /path/forwarded_port --execute
+orca qbittorrent.listen_port.sync --name dl --mode listen --port-file /gluetun/forwarded_port --execute
 ```
 
 `listen_port.sync` has two modes. It writes only on drift and treats `random_port`
@@ -97,9 +97,14 @@ as drift in both.
 
 - `announce` (default): behind a fixed NAT mapping (`PIA-PF-port -> host:6881`)
   qBittorrent keeps listening on `6881` and the PIA port goes to `announce_port`,
-  the port reported to trackers. Needs qBittorrent 5.1+.
+  the port reported to trackers. Needs qBittorrent 5.1+ built against libtorrent
+  2.0.11+ (older builds save the value but ignore it); it refuses otherwise.
+  It only changes what trackers and DHT are told, not the actual listener or
+  local service discovery.
 - `listen`: when inbound traffic reaches the client unmapped, the PIA port
-  becomes the listen port and `random_port` is turned off.
+  becomes the listen port, `random_port` is turned off and `announce_port` is
+  reset to `0`. Use it with gluetun's `forwarded_port` file: gluetun does not
+  remap the port.
 
 ## Layout
 

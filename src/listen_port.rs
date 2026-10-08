@@ -7,7 +7,7 @@
 //! When inbound traffic reaches the client unmapped, the PIA port is the
 //! listen port itself ([`Mode::Listen`]).
 
-use plugin_toolkit::http::Client as HttpClient;
+use plugin_toolkit::http::{Client as HttpClient, HttpError, RequestBuilder, Response};
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json;
 
@@ -35,8 +35,8 @@ pub enum Mode {
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct Preferences {
     pub listen_port: u16,
-    /// qBittorrent picks a fresh port at every start when set, discarding
-    /// `listen_port`.
+    /// Deprecated; reports `listen_port == 0`, where libtorrent binds an
+    /// ephemeral port.
     #[serde(default)]
     pub random_port: bool,
     #[serde(default)]
@@ -59,6 +59,12 @@ impl Preferences {
 #[serde(crate = "plugin_toolkit::serde")]
 struct TransferInfo {
     connection_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct BuildInfo {
+    libtorrent: String,
 }
 
 impl WebUi {
@@ -90,10 +96,7 @@ impl WebUi {
         Ok(Self { http, base, cookie })
     }
 
-    fn request(
-        &self,
-        req: plugin_toolkit::http::RequestBuilder,
-    ) -> plugin_toolkit::http::RequestBuilder {
+    fn request(&self, req: RequestBuilder) -> RequestBuilder {
         let req = req.header("Referer", self.base.clone());
         match &self.cookie {
             Some(c) => req.header("Cookie", c.clone()),
@@ -101,12 +104,20 @@ impl WebUi {
         }
     }
 
+    async fn send(&self, req: RequestBuilder, method: &str, path: &str) -> Result<Response> {
+        match self.request(req).send().await {
+            Ok(resp) => Ok(resp),
+            Err(HttpError::Status {
+                status, summary, ..
+            }) => bail!("{method} {path}: HTTP {status}: {summary}"),
+            Err(e) => bail!("{method} {path}: {e}"),
+        }
+    }
+
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let resp = self
-            .request(self.http.get(format!("{}{path}", self.base)))
-            .send()
-            .await
-            .map_err(|e| anyhow!("GET {path}: {e}"))?;
+            .send(self.http.get(format!("{}{path}", self.base)), "GET", path)
+            .await?;
         resp.json().map_err(|e| anyhow!("decode {path}: {e}"))
     }
 
@@ -120,19 +131,32 @@ impl WebUi {
         Ok(info.connection_status)
     }
 
-    pub async fn set_port(&self, mode: Mode, port: u16) -> Result<()> {
+    /// The libtorrent version qBittorrent was built against, e.g. `2.0.11.0`.
+    pub async fn libtorrent_version(&self) -> Result<String> {
+        let info: BuildInfo = self.get("/api/v2/app/buildInfo").await?;
+        Ok(info.libtorrent)
+    }
+
+    /// In listen mode `clear_announce` also resets `announce_port` to `0`, so
+    /// a stale value cannot override what trackers are told. Pass it only when
+    /// the client has the preference.
+    pub async fn set_port(&self, mode: Mode, port: u16, clear_announce: bool) -> Result<()> {
         let prefs = match mode {
+            Mode::Listen if clear_announce => serde_json::json!({
+                "listen_port": port, "random_port": false, "announce_port": 0
+            }),
             Mode::Listen => serde_json::json!({ "listen_port": port, "random_port": false }),
             Mode::Announce => serde_json::json!({ "announce_port": port }),
         };
-        self.request(
+        let path = "/api/v2/app/setPreferences";
+        self.send(
             self.http
-                .post(format!("{}/api/v2/app/setPreferences", self.base))
+                .post(format!("{}{path}", self.base))
                 .form(vec![("json".to_string(), prefs.to_string())]),
+            "POST",
+            path,
         )
-        .send()
-        .await
-        .map_err(|e| anyhow!("setPreferences: {e}"))?;
+        .await?;
         Ok(())
     }
 }
@@ -160,14 +184,47 @@ fn valid_port(p: u16) -> Option<u16> {
     (p != 0).then_some(p)
 }
 
+/// qBittorrent applies `announce_port` only when built against libtorrent
+/// 2.0.11+; on older builds it saves and reads back but has no effect.
+const MIN_ANNOUNCE_LIBTORRENT: (u32, u32, u32) = (2, 0, 11);
+
+/// Whether a libtorrent version string (`2.0.11.0`) supports `announce_port`.
+/// Unparseable versions count as unsupported.
+pub fn libtorrent_supports_announce(version: &str) -> bool {
+    let mut parts = version.trim().split('.').map(|p| p.parse::<u32>().ok());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c))) => (a, b, c) >= MIN_ANNOUNCE_LIBTORRENT,
+        _ => false,
+    }
+}
+
 const NO_ANNOUNCE_PORT: &str = "this qBittorrent has no announce_port preference (added in 5.1); \
      upgrade it, or use mode=listen with a NAT that forwards the PIA port unmapped";
 
-/// `random_port` counts as drift in both modes: it replaces the listen port on
-/// the next restart, which also moves the NAT target.
+/// Errors when announce mode cannot take effect on this client.
+fn require_announce(prefs: &Preferences, libtorrent: &str) -> Result<()> {
+    if prefs.announce_port.is_none() {
+        bail!(NO_ANNOUNCE_PORT);
+    }
+    if !libtorrent_supports_announce(libtorrent) {
+        bail!(
+            "this qBittorrent is built against libtorrent {libtorrent}; announce_port only takes \
+             effect with libtorrent 2.0.11+ (it saves but trackers keep getting the listen port). \
+             Upgrade qBittorrent, or use mode=listen with a NAT that forwards the PIA port unmapped"
+        );
+    }
+    Ok(())
+}
+
+/// `random_port` counts as drift in both modes: it reports `listen_port == 0`,
+/// where libtorrent binds an ephemeral port, so the NAT target is not fixed.
+/// In listen mode a non-zero `announce_port` other than the target is drift
+/// too, since trackers would be told that port instead.
 pub fn in_sync(prefs: &Preferences, mode: Mode, target: u16) -> Result<bool> {
     let port_ok = match mode {
-        Mode::Listen => prefs.listen_port == target,
+        Mode::Listen => {
+            prefs.listen_port == target && prefs.announce_port.is_none_or(|a| a == 0 || a == target)
+        }
         Mode::Announce => {
             prefs
                 .reported_port()
@@ -187,12 +244,17 @@ pub struct ListenPortStatus {
     pub announce_port: Option<u16>,
     pub random_port: bool,
     pub upnp: bool,
+    /// libtorrent version qBittorrent was built against.
+    pub libtorrent: String,
+    /// Whether `announce_port` reaches trackers: the preference exists and
+    /// libtorrent is 2.0.11+.
+    pub announce_effective: bool,
     /// `connected`, `firewalled` (no inbound peers reached it), or `disconnected`.
     pub connection_status: String,
     pub expected_port: Option<u16>,
     /// Whether the selected mode's port equals `expected_port` with
     /// `random_port` off. Absent without `expected_port`, or in announce mode
-    /// on a client without `announce_port`.
+    /// when `announce_effective` is false.
     pub matches: Option<bool>,
 }
 
@@ -202,14 +264,21 @@ pub async fn status(
     expected_port: Option<u16>,
 ) -> Result<ListenPortStatus> {
     let prefs = ui.preferences().await?;
+    let libtorrent = ui.libtorrent_version().await?;
     let connection_status = ui.connection_status().await?;
+    let announce_effective = require_announce(&prefs, &libtorrent).is_ok();
+    let matches = expected_port
+        .filter(|_| mode == Mode::Listen || announce_effective)
+        .and_then(|p| in_sync(&prefs, mode, p).ok());
     Ok(ListenPortStatus {
-        matches: expected_port.and_then(|p| in_sync(&prefs, mode, p).ok()),
+        matches,
         mode,
         listen_port: prefs.listen_port,
         announce_port: prefs.announce_port,
         random_port: prefs.random_port,
         upnp: prefs.upnp,
+        libtorrent,
+        announce_effective,
         connection_status,
         expected_port,
     })
@@ -226,25 +295,31 @@ pub struct ListenPortSync {
     pub announce_port: Option<u16>,
     pub random_port: bool,
     pub in_sync: bool,
+    /// Why `execute` would refuse to write. Set on a dry run too.
+    pub blocked: Option<String>,
     /// True only when this call wrote the port; a dry run never does.
     pub changed: bool,
     pub dry_run: bool,
 }
 
+const ANNOUNCE_RANDOM_PORT: &str = "random_port is on, so the listen port is not fixed; run \
+     mode=listen with the NAT's internal port first";
+
 pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<ListenPortSync> {
     let prefs = ui.preferences().await?;
+    if mode == Mode::Announce {
+        require_announce(&prefs, &ui.libtorrent_version().await?)?;
+    }
     let already = in_sync(&prefs, mode, target)?;
+    let blocked = (mode == Mode::Announce && prefs.random_port && !already)
+        .then(|| ANNOUNCE_RANDOM_PORT.to_string());
     let changed = execute && !already;
     if changed {
-        // With random_port on the WebUI reports listen_port 0, so there is no
-        // fixed port to keep while turning it off.
-        if mode == Mode::Announce && prefs.random_port {
-            bail!(
-                "random_port is on, so the listen port is not fixed; run mode=listen with \
-                 the NAT's internal port first"
-            );
+        if let Some(reason) = &blocked {
+            bail!("{reason}");
         }
-        ui.set_port(mode, target).await?;
+        ui.set_port(mode, target, prefs.announce_port.is_some())
+            .await?;
         let after = ui.preferences().await?;
         if !in_sync(&after, mode, target)? {
             bail!(
@@ -263,6 +338,7 @@ pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<
         announce_port: prefs.announce_port,
         random_port: prefs.random_port,
         in_sync: already,
+        blocked,
         changed,
         dry_run: !execute,
     })
@@ -288,6 +364,10 @@ mod tests {
     }
 
     async fn server(prefs: Value) -> MockServer {
+        server_lt(prefs, "2.0.11.0").await
+    }
+
+    async fn server_lt(prefs: Value, libtorrent: &str) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v2/auth/login"))
@@ -311,6 +391,15 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"connection_status": "firewalled"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/buildInfo"))
+            .and(header("cookie", SID))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"qt": "6.7.3", "libtorrent": libtorrent})),
             )
             .mount(&server)
             .await;
@@ -411,6 +500,85 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("%22listen_port%22%3A51234"), "{}", w[0]);
         assert!(w[0].contains("%22random_port%22%3Afalse"), "{}", w[0]);
+        assert!(!w[0].contains("announce_port"), "{}", w[0]);
+    }
+
+    #[tokio::test]
+    async fn listen_stale_announce_port_is_drift_and_the_write_clears_it() {
+        let server = server(prefs(51234, false, Some(0))).await;
+        first_read(&server, prefs(51234, false, Some(40000))).await;
+        accept_writes(&server).await;
+        let ui = login(&server).await;
+        let s = sync(&ui, Mode::Listen, 51234, true).await.unwrap();
+        assert!(!s.in_sync && s.changed);
+        assert_eq!(s.announce_port, Some(40000));
+        let w = writes(&server).await;
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("%22listen_port%22%3A51234"), "{}", w[0]);
+        assert!(w[0].contains("%22announce_port%22%3A0"), "{}", w[0]);
+    }
+
+    #[tokio::test]
+    async fn listen_status_flags_a_stale_announce_port() {
+        let server = server(prefs(51234, false, Some(40000))).await;
+        let ui = login(&server).await;
+        let s = status(&ui, Mode::Listen, Some(51234)).await.unwrap();
+        assert_eq!(s.matches, Some(false));
+    }
+
+    #[tokio::test]
+    async fn listen_execute_turns_off_random_port() {
+        let server = server(prefs(51234, false, None)).await;
+        first_read(&server, prefs(0, true, None)).await;
+        accept_writes(&server).await;
+        let ui = login(&server).await;
+        let s = sync(&ui, Mode::Listen, 51234, true).await.unwrap();
+        assert!(!s.in_sync && s.changed && s.blocked.is_none());
+        assert!(s.random_port);
+        assert_eq!(s.listen_port, 0);
+        let w = writes(&server).await;
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("%22listen_port%22%3A51234"), "{}", w[0]);
+        assert!(w[0].contains("%22random_port%22%3Afalse"), "{}", w[0]);
+    }
+
+    #[tokio::test]
+    async fn set_preferences_error_status_fails_with_status_and_path() {
+        let server = server(prefs(6881, false, None)).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/app/setPreferences"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let ui = login(&server).await;
+        let err = sync(&ui, Mode::Listen, 51234, true).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("POST /api/v2/app/setPreferences: HTTP 500"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_error_status_fails_with_status_and_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let ui = login(&server).await;
+        let err = ui.preferences().await.err().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("GET /api/v2/app/preferences: HTTP 403"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -427,16 +595,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn random_port_is_drift_even_when_port_matches() {
-        let server = server(prefs(51234, true, Some(51234))).await;
+    async fn random_port_is_drift_even_when_announce_port_matches() {
+        let server = server(prefs(0, true, Some(51234))).await;
         let ui = login(&server).await;
         assert!(!sync(&ui, Mode::Listen, 51234, false).await.unwrap().in_sync);
-        assert!(
-            !sync(&ui, Mode::Announce, 51234, false)
-                .await
-                .unwrap()
-                .in_sync
-        );
+        let s = sync(&ui, Mode::Announce, 51234, false).await.unwrap();
+        assert!(!s.in_sync);
+        assert!(s.blocked.is_some());
     }
 
     #[tokio::test]
@@ -497,6 +662,64 @@ mod tests {
             );
         }
         assert!(writes(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn announce_dry_run_reports_the_random_port_refusal() {
+        let server = server(prefs(0, true, Some(0))).await;
+        let ui = login(&server).await;
+        let s = sync(&ui, Mode::Announce, 51234, false).await.unwrap();
+        assert!(!s.in_sync && !s.changed && s.dry_run);
+        let reason = s.blocked.expect("blocked");
+        assert!(reason.contains("random_port is on"), "{reason}");
+        assert!(writes(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn announce_refuses_on_libtorrent_before_2_0_11() {
+        let server = server_lt(prefs(6881, false, Some(0)), "2.0.10.0").await;
+        accept_writes(&server).await;
+        let ui = login(&server).await;
+        for execute in [false, true] {
+            let err = sync(&ui, Mode::Announce, 51234, execute).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("libtorrent 2.0.10.0"), "{msg}");
+            assert!(msg.contains("2.0.11+"), "{msg}");
+        }
+        assert!(writes(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_on_libtorrent_2_0_10_marks_announce_ineffective() {
+        let server = server_lt(prefs(6881, false, Some(51234)), "2.0.10.0").await;
+        let ui = login(&server).await;
+        let s = status(&ui, Mode::Announce, Some(51234)).await.unwrap();
+        assert_eq!(s.libtorrent, "2.0.10.0");
+        assert!(!s.announce_effective);
+        assert_eq!(s.matches, None);
+        let s = status(&ui, Mode::Listen, Some(6881)).await.unwrap();
+        assert_eq!(s.matches, Some(false));
+    }
+
+    #[tokio::test]
+    async fn status_on_libtorrent_2_0_11_marks_announce_effective() {
+        let server = server_lt(prefs(6881, false, Some(51234)), "2.0.11.0").await;
+        let ui = login(&server).await;
+        let s = status(&ui, Mode::Announce, Some(51234)).await.unwrap();
+        assert_eq!(s.libtorrent, "2.0.11.0");
+        assert!(s.announce_effective);
+        assert_eq!(s.matches, Some(true));
+    }
+
+    #[test]
+    fn libtorrent_version_gate() {
+        assert!(libtorrent_supports_announce("2.0.11.0"));
+        assert!(libtorrent_supports_announce("2.0.11"));
+        assert!(libtorrent_supports_announce("2.1.0.0"));
+        assert!(!libtorrent_supports_announce("2.0.10.0"));
+        assert!(!libtorrent_supports_announce("1.2.19.0"));
+        assert!(!libtorrent_supports_announce(""));
+        assert!(!libtorrent_supports_announce("unknown"));
     }
 
     #[tokio::test]

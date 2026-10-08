@@ -49,9 +49,10 @@ pub struct ListenPortStatusArgs {
     pub expected_port: Option<u16>,
 }
 
-/// Read qBittorrent's BitTorrent listen and announce ports and connection
-/// status (`connected`/`firewalled`/`disconnected`), and whether the selected
-/// mode's port matches `expected_port`.
+/// Read qBittorrent's BitTorrent listen and announce ports, libtorrent version
+/// and whether `announce_port` takes effect, connection status
+/// (`connected`/`firewalled`/`disconnected`), and whether the selected mode's
+/// port matches `expected_port`.
 #[orca_tool(domain = "qbittorrent", verb = "listen_port.status", role = "any")]
 async fn qbittorrent_listen_port_status(
     args: ListenPortStatusArgs,
@@ -76,8 +77,9 @@ pub struct ListenPortSyncArgs {
     #[arg(long)]
     #[serde(default)]
     pub port: Option<u16>,
-    /// File holding the port (e.g. gluetun's `forwarded_port`), read on the
-    /// host running this plugin. Exclusive with `port`.
+    /// File holding the port, read on the host running this plugin, e.g.
+    /// gluetun's `forwarded_port` with `--mode listen` (gluetun forwards the
+    /// port unmapped). Exclusive with `port`.
     #[arg(long)]
     #[serde(default)]
     pub port_file: Option<String>,
@@ -88,9 +90,10 @@ pub struct ListenPortSyncArgs {
 }
 
 /// **Sync the port**: in `announce` mode (default) set the port reported to
-/// trackers (`announce_port`, qBittorrent 5.1+); in `listen` mode set the
-/// listen port. `random_port` counts as drift in both. Idempotent; writes only
-/// on drift. Without `execute`, reports drift and changes nothing.
+/// trackers (`announce_port`, qBittorrent 5.1+ built on libtorrent 2.0.11+);
+/// in `listen` mode set the listen port and reset `announce_port` to `0`.
+/// `random_port` counts as drift in both. Idempotent; writes only on drift.
+/// Without `execute`, reports drift and any refusal, and changes nothing.
 #[orca_tool(
     domain = "qbittorrent",
     verb = "listen_port.sync",
@@ -106,4 +109,52 @@ async fn qbittorrent_listen_port_sync(
     let target = listen_port::target_port(args.port, args.port_file.as_deref())?;
     let ui = connect(&args.name).await?;
     listen_port::sync(&ui, args.mode, target, args.execute).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plugin_toolkit::contract::config::{Config, Model, Ports};
+    use plugin_toolkit::contract::CallerIdentity;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolCtx {
+        ToolCtx::new(Arc::new(Config {
+            anthropic_api_key: None,
+            lmstudio_url: String::new(),
+            ollama_url: String::new(),
+            default_model: Model::LMStudio {
+                id: String::new(),
+                url: String::new(),
+            },
+            app_dir: std::env::temp_dir(),
+            memory_root: std::env::temp_dir(),
+            db_path: std::env::temp_dir().join("orca-test.db"),
+            ports: Ports::default(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_non_admins_before_touching_the_endpoint() {
+        let user = CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "user".into(),
+            can_mutate: true,
+        };
+        for (ctx, want) in [
+            (ctx(), "no caller identity"),
+            (ctx().with_auth(user), "requires role 'admin'"),
+        ] {
+            let args = ListenPortSyncArgs {
+                name: "dl".into(),
+                mode: Mode::Listen,
+                port: Some(51234),
+                port_file: None,
+                execute: false,
+            };
+            let err = qbittorrent_listen_port_sync(args, &ctx).await.unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+    }
 }
