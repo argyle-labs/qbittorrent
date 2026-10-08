@@ -116,9 +116,18 @@ mod tests {
     use super::*;
     use plugin_toolkit::contract::config::{Config, Model, Ports};
     use plugin_toolkit::contract::CallerIdentity;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
+
+    /// Keeps any orca state lookup off the live `~/.orca`.
+    fn orca_home() -> &'static std::path::Path {
+        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let dir = HOME.get_or_init(|| tempfile::tempdir().unwrap()).path();
+        std::env::set_var("ORCA_HOME", dir);
+        dir
+    }
 
     fn ctx() -> ToolCtx {
+        let home = orca_home();
         ToolCtx::new(Arc::new(Config {
             anthropic_api_key: None,
             lmstudio_url: String::new(),
@@ -127,9 +136,9 @@ mod tests {
                 id: String::new(),
                 url: String::new(),
             },
-            app_dir: std::env::temp_dir(),
-            memory_root: std::env::temp_dir(),
-            db_path: std::env::temp_dir().join("orca-test.db"),
+            app_dir: home.to_path_buf(),
+            memory_root: home.to_path_buf(),
+            db_path: home.join("orca.db"),
             ports: Ports::default(),
         }))
     }

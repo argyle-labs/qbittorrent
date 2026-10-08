@@ -201,38 +201,43 @@ pub fn libtorrent_supports_announce(version: &str) -> bool {
 const NO_ANNOUNCE_PORT: &str = "this qBittorrent has no announce_port preference (added in 5.1); \
      upgrade it, or use mode=listen with a NAT that forwards the PIA port unmapped";
 
-/// Errors when announce mode cannot take effect on this client.
-fn require_announce(prefs: &Preferences, libtorrent: &str) -> Result<()> {
+const ANNOUNCE_RANDOM_PORT: &str = "random_port is on, so the listen port is not fixed; run \
+     mode=listen with the NAT's internal port first";
+
+/// Whether `announce_port` reaches trackers on this client.
+fn announce_effective(prefs: &Preferences, libtorrent: &str) -> bool {
+    prefs.announce_port.is_some() && libtorrent_supports_announce(libtorrent)
+}
+
+/// Why announce mode cannot converge on this client, or `None` when it can.
+fn announce_blocked(prefs: &Preferences, libtorrent: &str) -> Option<String> {
     if prefs.announce_port.is_none() {
-        bail!(NO_ANNOUNCE_PORT);
+        return Some(NO_ANNOUNCE_PORT.to_string());
     }
     if !libtorrent_supports_announce(libtorrent) {
-        bail!(
+        return Some(format!(
             "this qBittorrent is built against libtorrent {libtorrent}; announce_port only takes \
              effect with libtorrent 2.0.11+ (it saves but trackers keep getting the listen port). \
              Upgrade qBittorrent, or use mode=listen with a NAT that forwards the PIA port unmapped"
-        );
+        ));
     }
-    Ok(())
+    prefs.random_port.then(|| ANNOUNCE_RANDOM_PORT.to_string())
 }
 
 /// `random_port` counts as drift in both modes: it reports `listen_port == 0`,
 /// where libtorrent binds an ephemeral port, so the NAT target is not fixed.
-/// In listen mode a non-zero `announce_port` other than the target is drift
-/// too, since trackers would be told that port instead.
-pub fn in_sync(prefs: &Preferences, mode: Mode, target: u16) -> Result<bool> {
+/// In listen mode an effective non-zero `announce_port` other than the target
+/// is drift too, since trackers would be told that port instead.
+pub fn in_sync(prefs: &Preferences, mode: Mode, target: u16, announce_effective: bool) -> bool {
     let port_ok = match mode {
         Mode::Listen => {
-            prefs.listen_port == target && prefs.announce_port.is_none_or(|a| a == 0 || a == target)
+            prefs.listen_port == target
+                && (!announce_effective
+                    || prefs.announce_port.is_none_or(|a| a == 0 || a == target))
         }
-        Mode::Announce => {
-            prefs
-                .reported_port()
-                .ok_or_else(|| anyhow!(NO_ANNOUNCE_PORT))?
-                == target
-        }
+        Mode::Announce => prefs.reported_port() == Some(target),
     };
-    Ok(port_ok && !prefs.random_port)
+    port_ok && !prefs.random_port
 }
 
 #[orca_struct]
@@ -266,10 +271,10 @@ pub async fn status(
     let prefs = ui.preferences().await?;
     let libtorrent = ui.libtorrent_version().await?;
     let connection_status = ui.connection_status().await?;
-    let announce_effective = require_announce(&prefs, &libtorrent).is_ok();
+    let announce_effective = announce_effective(&prefs, &libtorrent);
     let matches = expected_port
         .filter(|_| mode == Mode::Listen || announce_effective)
-        .and_then(|p| in_sync(&prefs, mode, p).ok());
+        .map(|p| in_sync(&prefs, mode, p, announce_effective));
     Ok(ListenPortStatus {
         matches,
         mode,
@@ -294,34 +299,37 @@ pub struct ListenPortSync {
     /// Announce port before this call.
     pub announce_port: Option<u16>,
     pub random_port: bool,
+    /// False whenever `blocked` is set.
     pub in_sync: bool,
-    /// Why `execute` would refuse to write. Set on a dry run too.
+    /// Why announce mode cannot converge: no `announce_port` preference,
+    /// libtorrent before 2.0.11, or `random_port` on. A dry run reports it;
+    /// `execute` fails with the same text.
     pub blocked: Option<String>,
     /// True only when this call wrote the port; a dry run never does.
     pub changed: bool,
     pub dry_run: bool,
 }
 
-const ANNOUNCE_RANDOM_PORT: &str = "random_port is on, so the listen port is not fixed; run \
-     mode=listen with the NAT's internal port first";
-
 pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<ListenPortSync> {
     let prefs = ui.preferences().await?;
-    if mode == Mode::Announce {
-        require_announce(&prefs, &ui.libtorrent_version().await?)?;
-    }
-    let already = in_sync(&prefs, mode, target)?;
-    let blocked = (mode == Mode::Announce && prefs.random_port && !already)
-        .then(|| ANNOUNCE_RANDOM_PORT.to_string());
-    let changed = execute && !already;
-    if changed {
+    let libtorrent = ui.libtorrent_version().await?;
+    let effective = announce_effective(&prefs, &libtorrent);
+    let blocked = match mode {
+        Mode::Listen => None,
+        Mode::Announce => announce_blocked(&prefs, &libtorrent),
+    };
+    let already = blocked.is_none() && in_sync(&prefs, mode, target, effective);
+    if execute {
         if let Some(reason) = &blocked {
             bail!("{reason}");
         }
+    }
+    let changed = execute && !already;
+    if changed {
         ui.set_port(mode, target, prefs.announce_port.is_some())
             .await?;
         let after = ui.preferences().await?;
-        if !in_sync(&after, mode, target)? {
+        if !in_sync(&after, mode, target, effective) {
             bail!(
                 "qbittorrent did not take {mode:?} port {target}: listen_port={} \
                  announce_port={:?} random_port={}",
@@ -649,43 +657,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn announce_refuses_without_the_preference() {
-        let server = server(prefs(6881, false, None)).await;
-        accept_writes(&server).await;
-        let ui = login(&server).await;
-        for execute in [false, true] {
-            let err = sync(&ui, Mode::Announce, 51234, execute).await.unwrap_err();
-            assert!(
-                err.to_string().contains("no announce_port preference"),
-                "{err}"
-            );
-        }
-        assert!(writes(&server).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn announce_dry_run_reports_the_random_port_refusal() {
-        let server = server(prefs(0, true, Some(0))).await;
-        let ui = login(&server).await;
-        let s = sync(&ui, Mode::Announce, 51234, false).await.unwrap();
+    /// A dry run reports the refusal in `blocked` alongside the port data;
+    /// execute fails with the same text and writes nothing.
+    async fn assert_announce_blocked(server: &MockServer, target: u16, want: &str) -> String {
+        accept_writes(server).await;
+        let ui = login(server).await;
+        let s = sync(&ui, Mode::Announce, target, false).await.unwrap();
         assert!(!s.in_sync && !s.changed && s.dry_run);
         let reason = s.blocked.expect("blocked");
-        assert!(reason.contains("random_port is on"), "{reason}");
-        assert!(writes(&server).await.is_empty());
+        assert!(reason.contains(want), "{reason}");
+        let err = sync(&ui, Mode::Announce, target, true).await.unwrap_err();
+        assert_eq!(err.to_string(), reason);
+        assert!(writes(server).await.is_empty());
+        reason
     }
 
     #[tokio::test]
-    async fn announce_refuses_on_libtorrent_before_2_0_11() {
+    async fn announce_blocks_without_the_preference() {
+        let server = server(prefs(6881, false, None)).await;
+        assert_announce_blocked(&server, 51234, "no announce_port preference").await;
+    }
+
+    #[tokio::test]
+    async fn announce_blocks_with_random_port_on() {
+        let server = server(prefs(0, true, Some(0))).await;
+        assert_announce_blocked(&server, 51234, "random_port is on").await;
+    }
+
+    #[tokio::test]
+    async fn announce_blocks_on_libtorrent_before_2_0_11() {
         let server = server_lt(prefs(6881, false, Some(0)), "2.0.10.0").await;
-        accept_writes(&server).await;
+        let reason = assert_announce_blocked(&server, 51234, "libtorrent 2.0.10.0").await;
+        assert!(reason.contains("2.0.11+"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn announce_blocked_is_never_in_sync_even_when_the_port_matches() {
+        let server = server_lt(prefs(6881, false, Some(51234)), "2.0.10.0").await;
+        assert_announce_blocked(&server, 51234, "libtorrent 2.0.10.0").await;
+    }
+
+    #[tokio::test]
+    async fn listen_ignores_an_ineffective_announce_port() {
+        let server = server_lt(prefs(51234, false, Some(40000)), "2.0.10.0").await;
         let ui = login(&server).await;
-        for execute in [false, true] {
-            let err = sync(&ui, Mode::Announce, 51234, execute).await.unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("libtorrent 2.0.10.0"), "{msg}");
-            assert!(msg.contains("2.0.11+"), "{msg}");
-        }
+        let s = sync(&ui, Mode::Listen, 51234, true).await.unwrap();
+        assert!(s.in_sync && !s.changed && s.blocked.is_none());
         assert!(writes(&server).await.is_empty());
     }
 
@@ -698,7 +715,11 @@ mod tests {
         assert!(!s.announce_effective);
         assert_eq!(s.matches, None);
         let s = status(&ui, Mode::Listen, Some(6881)).await.unwrap();
-        assert_eq!(s.matches, Some(false));
+        assert_eq!(
+            s.matches,
+            Some(true),
+            "ineffective announce_port is ignored"
+        );
     }
 
     #[tokio::test]
@@ -720,16 +741,6 @@ mod tests {
         assert!(!libtorrent_supports_announce("1.2.19.0"));
         assert!(!libtorrent_supports_announce(""));
         assert!(!libtorrent_supports_announce("unknown"));
-    }
-
-    #[tokio::test]
-    async fn announce_execute_refuses_with_random_port_on() {
-        let server = server(prefs(0, true, Some(0))).await;
-        accept_writes(&server).await;
-        let ui = login(&server).await;
-        let err = sync(&ui, Mode::Announce, 51234, true).await.unwrap_err();
-        assert!(err.to_string().contains("random_port is on"), "{err}");
-        assert!(writes(&server).await.is_empty());
     }
 
     #[tokio::test]
