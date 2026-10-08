@@ -85,15 +85,21 @@ orca service.configure qbittorrent   # apply config via the upstream API
 plus WebUI tools against a registered endpoint (`qbittorrent.create`):
 
 ```sh
+orca opnsense.pia.forwarded_port --name gw                           # -> {"port": 51234, ...}
 orca qbittorrent.listen_port.status --name dl --expected-port 51234
 orca qbittorrent.listen_port.sync --name dl --port 51234            # dry run: reports drift
-orca qbittorrent.listen_port.sync --name dl --port-file /path/forwarded_port --execute
+orca qbittorrent.listen_port.sync --name dl --port 51234 --execute
+orca qbittorrent.listen_port.sync --name dl --mode listen --port-file /path/forwarded_port --execute
 ```
 
-`listen_port.sync` sets qBittorrent's listen port (and turns off `random_port`) to
-the target: the VPN forwarded port when inbound traffic reaches the client
-unmapped, or the internal port of a fixed NAT mapping (`PIA-PF-port -> host:6881`
-means a target of `6881`). It writes only on drift.
+`listen_port.sync` has two modes. It writes only on drift and treats `random_port`
+as drift in both.
+
+- `announce` (default): behind a fixed NAT mapping (`PIA-PF-port -> host:6881`)
+  qBittorrent keeps listening on `6881` and the PIA port goes to `announce_port`,
+  the port reported to trackers. Needs qBittorrent 5.1+.
+- `listen`: when inbound traffic reaches the client unmapped, the PIA port
+  becomes the listen port and `random_port` is turned off.
 
 ## Layout
 

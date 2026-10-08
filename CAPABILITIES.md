@@ -15,9 +15,9 @@ generic `service.*` surface — no per-plugin tools. Runtimes: **docker,podman,l
 
 ## Tools (`qbittorrent.`)
 - [x] endpoint registry `qbittorrent.{list,detail,create,update,delete}` — routes + username + password (secret)
-- [x] `listen_port.status` — listen port, `connected`/`firewalled`/`disconnected`, match against an expected port
-- [x] `listen_port.sync` — converge the listen port on a target port (explicit or from a port file); dry run by default
-- [ ] read the live PIA forwarded port from orca (no plugin exposes it yet; see argyle-labs/opnsense)
+- [x] `listen_port.status` — listen/announce ports, `connected`/`firewalled`/`disconnected`, match against an expected port
+- [x] `listen_port.sync` — converge the announce port (default) or listen port on a target port (explicit or from a port file); dry run by default
+- [x] PIA forwarded port source: `opnsense.pia.forwarded_port` → `listen_port.sync --port`
 
 ## Provided generically by orca (NO code here)
 - `deploy` — `service.deploy` → `deploy_target.launch(WorkloadSpec)`
