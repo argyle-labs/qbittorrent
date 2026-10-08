@@ -226,18 +226,23 @@ fn announce_blocked(prefs: &Preferences, libtorrent: &str) -> Option<String> {
 
 /// `random_port` counts as drift in both modes: it reports `listen_port == 0`,
 /// where libtorrent binds an ephemeral port, so the NAT target is not fixed.
-/// In listen mode an effective non-zero `announce_port` other than the target
-/// is drift too, since trackers would be told that port instead.
-pub fn in_sync(prefs: &Preferences, mode: Mode, target: u16, announce_effective: bool) -> bool {
+/// In listen mode, with `check_announce`, a non-zero `announce_port` other than
+/// the target is drift too, since trackers would be told that port instead.
+pub fn in_sync(prefs: &Preferences, mode: Mode, target: u16, check_announce: bool) -> bool {
     let port_ok = match mode {
         Mode::Listen => {
             prefs.listen_port == target
-                && (!announce_effective
-                    || prefs.announce_port.is_none_or(|a| a == 0 || a == target))
+                && (!check_announce || leftover_announce_port(prefs, target).is_none())
         }
         Mode::Announce => prefs.reported_port() == Some(target),
     };
     port_ok && !prefs.random_port
+}
+
+/// A non-zero `announce_port` that would make trackers hear something other
+/// than `listen_port`.
+fn leftover_announce_port(prefs: &Preferences, listen_port: u16) -> Option<u16> {
+    prefs.announce_port.filter(|&a| a != 0 && a != listen_port)
 }
 
 #[orca_struct]
@@ -261,6 +266,10 @@ pub struct ListenPortStatus {
     /// `random_port` off. Absent without `expected_port`, or in announce mode
     /// when `announce_effective` is false.
     pub matches: Option<bool>,
+    /// Listen mode only: a non-zero `announce_port` that has no effect on this
+    /// libtorrent but takes over once qBittorrent is upgraded. `matches`
+    /// ignores it; `listen_port.sync --execute` clears it.
+    pub leftover_announce_port: Option<u16>,
 }
 
 pub async fn status(
@@ -275,8 +284,12 @@ pub async fn status(
     let matches = expected_port
         .filter(|_| mode == Mode::Listen || announce_effective)
         .map(|p| in_sync(&prefs, mode, p, announce_effective));
+    let leftover_announce_port = (mode == Mode::Listen && !announce_effective)
+        .then(|| leftover_announce_port(&prefs, prefs.listen_port))
+        .flatten();
     Ok(ListenPortStatus {
         matches,
+        leftover_announce_port,
         mode,
         listen_port: prefs.listen_port,
         announce_port: prefs.announce_port,
@@ -312,13 +325,13 @@ pub struct ListenPortSync {
 
 pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<ListenPortSync> {
     let prefs = ui.preferences().await?;
-    let libtorrent = ui.libtorrent_version().await?;
-    let effective = announce_effective(&prefs, &libtorrent);
     let blocked = match mode {
         Mode::Listen => None,
-        Mode::Announce => announce_blocked(&prefs, &libtorrent),
+        Mode::Announce => announce_blocked(&prefs, &ui.libtorrent_version().await?),
     };
-    let already = blocked.is_none() && in_sync(&prefs, mode, target, effective);
+    // Listen mode clears a leftover announce_port even where libtorrent ignores
+    // it today: it takes effect once qBittorrent is upgraded.
+    let already = blocked.is_none() && in_sync(&prefs, mode, target, true);
     if execute {
         if let Some(reason) = &blocked {
             bail!("{reason}");
@@ -329,7 +342,7 @@ pub async fn sync(ui: &WebUi, mode: Mode, target: u16, execute: bool) -> Result<
         ui.set_port(mode, target, prefs.announce_port.is_some())
             .await?;
         let after = ui.preferences().await?;
-        if !in_sync(&after, mode, target, effective) {
+        if !in_sync(&after, mode, target, true) {
             bail!(
                 "qbittorrent did not take {mode:?} port {target}: listen_port={} \
                  announce_port={:?} random_port={}",
@@ -698,12 +711,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listen_ignores_an_ineffective_announce_port() {
-        let server = server_lt(prefs(51234, false, Some(40000)), "2.0.10.0").await;
+    async fn listen_clears_an_ineffective_announce_port_and_status_flags_it() {
+        let server = server_lt(prefs(51234, false, Some(0)), "2.0.10.0").await;
+        // One stale read for status, one for sync; the re-read after the write
+        // gets the server default.
+        for _ in 0..2 {
+            first_read(&server, prefs(51234, false, Some(40000))).await;
+        }
+        accept_writes(&server).await;
         let ui = login(&server).await;
+        let s = status(&ui, Mode::Listen, Some(51234)).await.unwrap();
+        assert_eq!(s.matches, Some(true));
+        assert_eq!(s.leftover_announce_port, Some(40000));
         let s = sync(&ui, Mode::Listen, 51234, true).await.unwrap();
-        assert!(s.in_sync && !s.changed && s.blocked.is_none());
-        assert!(writes(&server).await.is_empty());
+        assert!(!s.in_sync && s.changed && s.blocked.is_none());
+        let w = writes(&server).await;
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("%22announce_port%22%3A0"), "{}", w[0]);
+        let s = status(&ui, Mode::Listen, Some(51234)).await.unwrap();
+        assert_eq!(s.leftover_announce_port, None);
     }
 
     #[tokio::test]
