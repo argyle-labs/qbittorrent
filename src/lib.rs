@@ -8,6 +8,7 @@
 
 pub mod execute;
 pub mod listen_port;
+pub mod temp_path;
 pub mod tools;
 
 use plugin_toolkit::service::{
