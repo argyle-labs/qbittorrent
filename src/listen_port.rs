@@ -114,7 +114,7 @@ impl WebUi {
         }
     }
 
-    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+    pub(crate) async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let resp = self
             .send(self.http.get(format!("{}{path}", self.base)), "GET", path)
             .await?;

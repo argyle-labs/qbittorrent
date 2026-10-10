@@ -6,11 +6,13 @@
 //! WebUI tools:
 //!   - `qbittorrent.listen_port.status`  listen/announce ports, reachability, match against an expected port
 //!   - `qbittorrent.listen_port.sync`    converge the listen or announce port on a target (dry run by default)
+//!   - `qbittorrent.temp_path.status`    whether incomplete downloads (global and per-category) land on a local path
 
 use plugin_toolkit::prelude::*;
 
 use crate::execute;
 use crate::listen_port::{self, ListenPortStatus, ListenPortSync, Mode, WebUi};
+use crate::temp_path::{self, TempPathStatus};
 
 #[endpoint_resource(plugin = "qbittorrent")]
 pub struct QbittorrentEndpoint {
@@ -114,6 +116,29 @@ async fn qbittorrent_listen_port_sync(
     listen_port::sync(&ui, args.mode, target, args.execute).await
 }
 
+#[orca_struct(args)]
+pub struct TempPathStatusArgs {
+    /// Registered qbittorrent endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Container path of a network-backed mount (repeatable), e.g. `/downloads`.
+    #[arg(long = "network-prefix")]
+    #[serde(default)]
+    pub network_prefixes: Vec<String>,
+}
+
+/// Report whether incomplete torrents are written to a local temp path. Flags a
+/// disabled temp path, one under a `network_prefixes` mount, or one inside the
+/// save path.
+#[orca_tool(domain = "qbittorrent", verb = "temp_path.status", role = "any")]
+async fn qbittorrent_temp_path_status(
+    args: TempPathStatusArgs,
+    _ctx: &ToolCtx,
+) -> Result<TempPathStatus> {
+    let ui = connect(&args.name).await?;
+    temp_path::status(&ui, &args.network_prefixes).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +188,59 @@ mod tests {
             let err = qbittorrent_listen_port_sync(args, &ctx).await.unwrap_err();
             assert!(err.to_string().contains(want), "{err}");
         }
+    }
+
+    #[test]
+    fn temp_path_args_default_network_prefixes() {
+        let args: TempPathStatusArgs = plugin_toolkit::serde_json::from_value(
+            plugin_toolkit::serde_json::json!({"name": "dl"}),
+        )
+        .unwrap();
+        assert!(args.network_prefixes.is_empty());
+    }
+
+    /// The endpoint registry needs the daemon's DB sink, so this drives the
+    /// tool's path after `connect`: login, preferences, categories.
+    #[tokio::test]
+    async fn temp_path_status_reads_preferences_and_categories() {
+        use plugin_toolkit::serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "SID=t; HttpOnly; path=/")
+                    .set_body_string("Ok."),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "save_path": "/downloads/complete",
+                "temp_path": "/incomplete",
+                "temp_path_enabled": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/categories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "radarr": {"name": "radarr", "savePath": "/downloads/movies",
+                           "download_path": "/downloads/movies/.inc"}
+            })))
+            .mount(&server)
+            .await;
+
+        let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
+        let s = temp_path::status(&ui, &["/downloads".into()])
+            .await
+            .unwrap();
+        assert_eq!(s.temp_path, "/incomplete");
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert!(s.problems[0].starts_with("category 'radarr' download path"));
     }
 }
