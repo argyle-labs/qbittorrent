@@ -71,6 +71,16 @@ pub(crate) fn under(path: &str, prefix: &str) -> bool {
     }
 }
 
+/// `path` made absolute against `base`, as qBittorrent resolves relative
+/// category paths. Left as is when `base` is relative too.
+pub(crate) fn resolve(path: &str, base: &str) -> String {
+    if path.starts_with('/') || !base.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{path}", base.trim_end_matches('/'))
+    }
+}
+
 /// Problems with one effective incomplete path.
 fn check_incomplete(
     label: &str,
@@ -100,7 +110,12 @@ pub fn assess(
         categories
             .iter()
             .filter(|(_, c)| !c.save_path.is_empty())
-            .map(|(n, c)| (format!("category '{n}'"), c.save_path.clone())),
+            .map(|(n, c)| {
+                (
+                    format!("category '{n}'"),
+                    resolve(&c.save_path, &prefs.save_path),
+                )
+            }),
     );
     let mut problems = Vec::new();
     if !prefs.temp_path_enabled {
@@ -118,11 +133,19 @@ pub fn assess(
             network_prefixes,
         ));
     }
+    // Relative category download paths sit under the global temp path, which
+    // qBittorrent keeps configured even while it is disabled.
+    let download_base = if prefs.temp_path.trim().is_empty() {
+        prefs.save_path.as_str()
+    } else {
+        prefs.temp_path.as_str()
+    };
     for (name, cat) in categories {
         let label = format!("category '{name}' download path");
         match &cat.download_path {
             Some(plugin_toolkit::serde_json::Value::String(p)) if !p.trim().is_empty() => {
-                problems.extend(check_incomplete(&label, p, &save_paths, network_prefixes));
+                let p = resolve(p.trim(), download_base);
+                problems.extend(check_incomplete(&label, &p, &save_paths, network_prefixes));
             }
             Some(plugin_toolkit::serde_json::Value::Bool(false)) => problems.push(format!(
                 "{label} disabled: incomplete downloads go straight to {}",
@@ -248,5 +271,69 @@ mod tests {
             .problems
             .iter()
             .any(|p| p.contains("'lidarr' download path disabled")));
+    }
+
+    #[test]
+    fn relative_category_paths_resolve_against_their_bases() {
+        let c = cats(json!({
+            "tv": {"name": "tv", "savePath": "tv", "download_path": "tv-inc"},
+            "nested": {"name": "nested", "savePath": "/local/x", "download_path": "../data/tv/inc"}
+        }));
+        let s = assess(prefs("/data", "/local/inc", true), &c, &["/data".into()]);
+        // tv-inc -> /local/inc/tv-inc (local); ../data/tv/inc -> /local/data/tv/inc (local).
+        assert!(s.ok, "{:?}", s.problems);
+        let s = assess(prefs("/data", "/data/inc", true), &c, &[]);
+        // Temp inside the default save path, and tv-inc -> /data/inc/tv-inc inside it too.
+        assert!(
+            s.problems
+                .iter()
+                .any(|p| p.contains("category 'tv' download path /data/inc/tv-inc")),
+            "{:?}",
+            s.problems
+        );
+        let s = assess(
+            prefs("/data", "/incomplete", true),
+            &cats(json!({"tv": {"name": "tv", "savePath": "tv"}})),
+            &[],
+        );
+        assert!(s.ok);
+        let s = assess(
+            prefs("/data", "/data/tv/inc", true),
+            &cats(json!({"tv": {"name": "tv", "savePath": "tv"}})),
+            &[],
+        );
+        assert!(
+            s.problems
+                .iter()
+                .any(|p| p.contains("category 'tv' save path /data/tv")),
+            "{:?}",
+            s.problems
+        );
+    }
+
+    #[test]
+    fn global_temp_disabled_with_a_category_download_path() {
+        let c = cats(json!({
+            "tv": {"name": "tv", "savePath": "/data/tv", "download_path": "/incomplete/tv"},
+            "movies": {"name": "movies", "savePath": "/data/movies"}
+        }));
+        let s = assess(prefs("/data", "", false), &c, &["/data".into()]);
+        // The category's own local path is fine; categories inheriting the
+        // disabled global setting are covered by the one global problem.
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert!(s.problems[0].starts_with("temp path disabled"));
+        let s = assess(
+            prefs("/data", "", false),
+            &cats(json!({"tv": {"name": "tv", "savePath": "/data/tv", "download_path": "inc"}})),
+            &[],
+        );
+        // Relative to the save path when no temp path is configured.
+        assert!(
+            s.problems
+                .iter()
+                .any(|p| p.contains("download path /data/inc")),
+            "{:?}",
+            s.problems
+        );
     }
 }
