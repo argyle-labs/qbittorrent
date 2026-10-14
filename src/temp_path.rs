@@ -173,6 +173,77 @@ pub async fn status(ui: &WebUi, network_prefixes: &[String]) -> Result<TempPathS
     Ok(assess(prefs, &categories, network_prefixes))
 }
 
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempPathSync {
+    pub target: String,
+    /// Global temp path before this call.
+    pub temp_path: String,
+    pub temp_path_enabled: bool,
+    pub in_sync: bool,
+    /// True only when this call wrote preferences; a dry run never does.
+    pub changed: bool,
+    pub dry_run: bool,
+}
+
+/// Point the global incomplete path at `target` and enable it. Refuses a target
+/// on a network mount or inside a save path, the conditions `status` flags.
+/// Per-category download paths are left as configured.
+pub async fn sync(
+    ui: &WebUi,
+    target: &str,
+    network_prefixes: &[String],
+    dry_run: bool,
+) -> Result<TempPathSync> {
+    let Some(want) = normalize(target) else {
+        bail!("temp path must be absolute: {target}");
+    };
+    let prefs: TempPathPrefs = ui.get("/api/v2/app/preferences").await?;
+    let categories: BTreeMap<String, Category> = ui.get("/api/v2/torrents/categories").await?;
+    let mut save_paths = vec![("default".to_string(), prefs.save_path.clone())];
+    save_paths.extend(
+        categories
+            .iter()
+            .filter(|(_, c)| !c.save_path.is_empty())
+            .map(|(n, c)| {
+                (
+                    format!("category '{n}'"),
+                    resolve(&c.save_path, &prefs.save_path),
+                )
+            }),
+    );
+    if let Some(problem) = check_incomplete("target", target, &save_paths, network_prefixes)
+        .into_iter()
+        .next()
+    {
+        bail!("{problem}");
+    }
+    let in_sync = prefs.temp_path_enabled && normalize(&prefs.temp_path) == Some(want);
+    let changed = !dry_run && !in_sync;
+    if changed {
+        ui.set_preferences(&plugin_toolkit::serde_json::json!({
+            "temp_path": target, "temp_path_enabled": true
+        }))
+        .await?;
+        let after: TempPathPrefs = ui.get("/api/v2/app/preferences").await?;
+        if !after.temp_path_enabled || normalize(&after.temp_path) != normalize(target) {
+            bail!(
+                "qbittorrent did not take temp path {target}: temp_path={} temp_path_enabled={}",
+                after.temp_path,
+                after.temp_path_enabled
+            );
+        }
+    }
+    Ok(TempPathSync {
+        target: target.to_string(),
+        temp_path: prefs.temp_path,
+        temp_path_enabled: prefs.temp_path_enabled,
+        in_sync,
+        changed,
+        dry_run,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +406,108 @@ mod tests {
             "{:?}",
             s.problems
         );
+    }
+
+    mod sync {
+        use super::super::*;
+        use plugin_toolkit::serde_json::json;
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn server(prefs: serde_json::Value) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/auth/login"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("set-cookie", "SID=t; HttpOnly; path=/")
+                        .set_body_string("Ok."),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v2/app/preferences"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(prefs))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v2/torrents/categories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        use plugin_toolkit::serde_json;
+
+        #[tokio::test]
+        async fn dry_run_reports_drift_without_writing() {
+            let server = server(
+                json!({"save_path": "/downloads", "temp_path": "", "temp_path_enabled": false}),
+            )
+            .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/app/setPreferences"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
+            let s = sync(&ui, "/incomplete", &["/downloads".into()], true)
+                .await
+                .unwrap();
+            assert!(!s.in_sync && !s.changed && s.dry_run);
+        }
+
+        #[tokio::test]
+        async fn in_sync_target_writes_nothing() {
+            let server = server(json!({"save_path": "/downloads", "temp_path": "/incomplete/", "temp_path_enabled": true})).await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/app/setPreferences"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
+            let s = sync(&ui, "/incomplete", &[], false).await.unwrap();
+            assert!(s.in_sync && !s.changed);
+        }
+
+        #[tokio::test]
+        async fn execute_fails_when_the_write_does_not_take() {
+            let server = server(
+                json!({"save_path": "/downloads", "temp_path": "", "temp_path_enabled": false}),
+            )
+            .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/app/setPreferences"))
+                .and(body_string_contains("temp_path_enabled"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
+            let err = sync(&ui, "/incomplete", &[], false).await.unwrap_err();
+            assert!(err.to_string().contains("did not take"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn refuses_a_network_or_save_path_target() {
+            let server = server(
+                json!({"save_path": "/downloads", "temp_path": "", "temp_path_enabled": false}),
+            )
+            .await;
+            let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
+            let err = sync(&ui, "/mnt/share/inc", &["/mnt/share".into()], true)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("network mount"), "{err}");
+            let err = sync(&ui, "/downloads/inc", &[], true).await.unwrap_err();
+            assert!(
+                err.to_string().contains("inside default save path"),
+                "{err}"
+            );
+            assert!(sync(&ui, "inc", &[], true).await.is_err());
+        }
     }
 }

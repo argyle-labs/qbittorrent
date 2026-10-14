@@ -148,6 +148,11 @@ impl WebUi {
             Mode::Listen => serde_json::json!({ "listen_port": port, "random_port": false }),
             Mode::Announce => serde_json::json!({ "announce_port": port }),
         };
+        self.set_preferences(&prefs).await
+    }
+
+    /// Partial update: keys absent from `prefs` keep their values.
+    pub(crate) async fn set_preferences(&self, prefs: &serde_json::Value) -> Result<()> {
         let path = "/api/v2/app/setPreferences";
         self.send(
             self.http
