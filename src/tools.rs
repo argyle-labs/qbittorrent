@@ -7,12 +7,13 @@
 //!   - `qbittorrent.listen_port.status`  listen/announce ports, reachability, match against an expected port
 //!   - `qbittorrent.listen_port.sync`    converge the listen or announce port on a target (dry run by default)
 //!   - `qbittorrent.temp_path.status`    whether incomplete downloads (global and per-category) land on a local path
+//!   - `qbittorrent.temp_path.sync`      point the global incomplete path at a local dir and enable it
 
 use plugin_toolkit::prelude::*;
 
 use crate::execute;
 use crate::listen_port::{self, ListenPortStatus, ListenPortSync, Mode, WebUi};
-use crate::temp_path::{self, TempPathStatus};
+use crate::temp_path::{self, TempPathStatus, TempPathSync};
 
 #[endpoint_resource(plugin = "qbittorrent")]
 pub struct QbittorrentEndpoint {
@@ -139,6 +140,41 @@ async fn qbittorrent_temp_path_status(
     temp_path::status(&ui, &args.network_prefixes).await
 }
 
+#[orca_struct(args)]
+pub struct TempPathSyncArgs {
+    /// Registered qbittorrent endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Container path for incomplete downloads, backed by a local volume.
+    #[arg(long)]
+    pub temp_path: String,
+    /// Container path of a network-backed mount (repeatable); a target under
+    /// one is refused.
+    #[arg(long = "network-prefix")]
+    #[serde(default)]
+    pub network_prefixes: Vec<String>,
+    /// Report drift and change nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// **Remediation.** Set the global incomplete path (`temp_path`) to a local
+/// directory and enable it through the WebUI API, so in-progress torrents stop
+/// writing to the network share. The volume behind `temp_path` must already be
+/// mounted into the container. Idempotent; writes only on drift.
+#[orca_tool(
+    domain = "qbittorrent",
+    verb = "temp_path.sync",
+    role = "admin",
+    execute_gated = false
+)]
+async fn qbittorrent_temp_path_sync(args: TempPathSyncArgs, ctx: &ToolCtx) -> Result<TempPathSync> {
+    execute::require_admin("qbittorrent.temp_path.sync", ctx)?;
+    let ui = connect(&args.name).await?;
+    temp_path::sync(&ui, &args.temp_path, &args.network_prefixes, args.dry_run).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +222,14 @@ mod tests {
                 execute: false,
             };
             let err = qbittorrent_listen_port_sync(args, &ctx).await.unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+            let args = TempPathSyncArgs {
+                name: "dl".into(),
+                temp_path: "/incomplete".into(),
+                network_prefixes: vec![],
+                dry_run: true,
+            };
+            let err = qbittorrent_temp_path_sync(args, &ctx).await.unwrap_err();
             assert!(err.to_string().contains(want), "{err}");
         }
     }
