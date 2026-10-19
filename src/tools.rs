@@ -26,14 +26,9 @@ pub struct QbittorrentEndpoint {
 
 async fn connect(name: &str) -> Result<WebUi> {
     let row = endpoint_db::require(name)?;
-    let password = plugin_toolkit::secrets::resolve_scoped(
-        "qbittorrent",
-        name,
-        "password",
-        (!row.password.is_empty()).then_some(row.password.as_str()),
-    )?;
+    let password = plugin_toolkit::secrets::resolve_scoped("qbittorrent", name, "password")?;
     let base_url = route::resolve_reachable(name, &row.routes, false).await?;
-    WebUi::login(&base_url, &row.username, &password).await
+    WebUi::login(&base_url, &row.username, password.expose_secret()).await
 }
 
 #[orca_struct(args)]
