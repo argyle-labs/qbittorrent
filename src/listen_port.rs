@@ -151,6 +151,16 @@ impl WebUi {
         self.set_preferences(&prefs).await
     }
 
+    pub(crate) async fn post_form(&self, path: &str, form: Vec<(String, String)>) -> Result<()> {
+        self.send(
+            self.http.post(format!("{}{path}", self.base)).form(form),
+            "POST",
+            path,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Partial update: keys absent from `prefs` keep their values.
     pub(crate) async fn set_preferences(&self, prefs: &serde_json::Value) -> Result<()> {
         let path = "/api/v2/app/setPreferences";

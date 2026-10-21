@@ -8,9 +8,12 @@
 //!   - `qbittorrent.listen_port.sync`    converge the listen or announce port on a target (dry run by default)
 //!   - `qbittorrent.temp_path.status`    whether incomplete downloads (global and per-category) land on a local path
 //!   - `qbittorrent.temp_path.sync`      point the global incomplete path at a local dir and enable it
+//!   - `qbittorrent.categories.status`   drift between a desired category set and the client
+//!   - `qbittorrent.categories.sync`     create missing categories and correct save paths
 
 use plugin_toolkit::prelude::*;
 
+use crate::categories::{self, CategoriesStatus, CategoriesSync};
 use crate::execute;
 use crate::listen_port::{self, ListenPortStatus, ListenPortSync, Mode, WebUi};
 use crate::temp_path::{self, TempPathStatus, TempPathSync};
@@ -170,6 +173,65 @@ async fn qbittorrent_temp_path_sync(args: TempPathSyncArgs, ctx: &ToolCtx) -> Re
     temp_path::sync(&ui, &args.temp_path, &args.network_prefixes, args.dry_run).await
 }
 
+#[orca_struct(args)]
+pub struct CategoriesStatusArgs {
+    /// Registered qbittorrent endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Desired category as `name=save_path` (repeatable); a relative save path
+    /// resolves against the default save path.
+    #[arg(long = "category")]
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+/// Compare the desired category set with the client: missing categories,
+/// wrong save paths, categories not in the set, and categories sharing a save
+/// path (two consumers on one category steal each other's grabs).
+#[orca_tool(domain = "qbittorrent", verb = "categories.status", role = "any")]
+async fn qbittorrent_categories_status(
+    args: CategoriesStatusArgs,
+    _ctx: &ToolCtx,
+) -> Result<CategoriesStatus> {
+    let desired = categories::parse_desired(&args.categories)?;
+    let ui = connect(&args.name).await?;
+    categories::status(&ui, &desired).await
+}
+
+#[orca_struct(args)]
+pub struct CategoriesSyncArgs {
+    /// Registered qbittorrent endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Desired category as `name=save_path` (repeatable).
+    #[arg(long = "category")]
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Report drift and change nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// **Remediation.** Create missing categories and correct save paths through
+/// the WebUI API. Categories outside the set are never removed; shared save
+/// paths are reported only. Idempotent; writes only on drift.
+#[orca_tool(
+    domain = "qbittorrent",
+    verb = "categories.sync",
+    role = "admin",
+    execute_gated = false
+)]
+async fn qbittorrent_categories_sync(
+    args: CategoriesSyncArgs,
+    ctx: &ToolCtx,
+) -> Result<CategoriesSync> {
+    execute::require_admin("qbittorrent.categories.sync", ctx)?;
+    let desired = categories::parse_desired(&args.categories)?;
+    let ui = connect(&args.name).await?;
+    categories::sync(&ui, &desired, args.dry_run).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +287,13 @@ mod tests {
                 dry_run: true,
             };
             let err = qbittorrent_temp_path_sync(args, &ctx).await.unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+            let args = CategoriesSyncArgs {
+                name: "dl".into(),
+                categories: vec!["radarr=/data/movies".into()],
+                dry_run: true,
+            };
+            let err = qbittorrent_categories_sync(args, &ctx).await.unwrap_err();
             assert!(err.to_string().contains(want), "{err}");
         }
     }
