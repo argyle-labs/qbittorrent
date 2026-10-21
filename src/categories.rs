@@ -239,7 +239,7 @@ mod tests {
         assert!(s.ok, "{s:?}");
     }
 
-    async fn server(cats: serde_json::Value) -> MockServer {
+    async fn base_server() -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v2/auth/login"))
@@ -255,12 +255,34 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"save_path": "/data"})))
             .mount(&server)
             .await;
+        server
+    }
+
+    async fn server(cats: serde_json::Value) -> MockServer {
+        let server = base_server().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/categories"))
             .respond_with(ResponseTemplate::new(200).set_body_json(cats))
             .mount(&server)
             .await;
         server
+    }
+
+    async fn mount_writes(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/createCategory"))
+            .and(body_string_contains("category=radarr"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/editCategory"))
+            .and(body_string_contains("category=sonarr"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
@@ -280,21 +302,44 @@ mod tests {
 
     #[tokio::test]
     async fn execute_creates_and_edits_then_verifies() {
-        let server = server(json!({"sonarr": {"savePath": "/data/series"}})).await;
-        Mock::given(method("POST"))
-            .and(path("/api/v2/torrents/createCategory"))
-            .and(body_string_contains("category=radarr"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/v2/torrents/editCategory"))
-            .and(body_string_contains("category=sonarr"))
-            .respond_with(ResponseTemplate::new(200))
+        let server = base_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/categories"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"sonarr": {"savePath": "/data/series"}})),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/categories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "radarr": {"savePath": "/data/movies"},
+                "radarr-4k": {"savePath": "/data/movies-4k"},
+                "sonarr": {"savePath": "/data/tv"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_writes(&server).await;
+        let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
+        let s = sync(&ui, &desired(), false).await.unwrap();
+        assert_eq!(
+            s.created,
+            vec!["radarr".to_string(), "radarr-4k".to_string()]
+        );
+        assert_eq!(s.edited, vec!["sonarr".to_string()]);
+        assert_eq!(s.before.missing.len(), 2);
+        assert!(!s.dry_run);
+    }
+
+    #[tokio::test]
+    async fn execute_fails_when_read_back_still_drifts() {
+        let server = server(json!({"sonarr": {"savePath": "/data/series"}})).await;
+        mount_writes(&server).await;
         let ui = WebUi::login(&server.uri(), "admin", "pw").await.unwrap();
         let err = sync(&ui, &desired(), false).await.unwrap_err();
         assert!(err.to_string().contains("did not take"), "{err}");
