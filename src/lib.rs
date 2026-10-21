@@ -6,6 +6,7 @@
 //! `plugin-toolkit`. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
+pub mod categories;
 pub mod execute;
 pub mod listen_port;
 pub mod temp_path;
